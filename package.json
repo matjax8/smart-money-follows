@@ -1,0 +1,29 @@
+{
+  "name": "smart-money-follows",
+  "version": "1.0.0",
+  "description": "Smart Money signal engine — tracks Nansen smart wallets, cross-references sentiment, paper trades on Kraken",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "ts-node src/index.ts",
+    "start:compiled": "node dist/index.js",
+    "dev": "ts-node src/index.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/matjax8/smart-money-follows.git"
+  },
+  "keywords": ["nansen", "crypto", "smart-money", "trading", "terminal"],
+  "author": "matjax8",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "blessed": "^0.1.81"
+  },
+  "devDependencies": {
+    "@types/blessed": "^0.1.25",
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.0.0"
+  }
+}
