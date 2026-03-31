@@ -4,10 +4,7 @@
 // ============================================================
 
 import { FearGreed, FundingRate } from './sentiment';
-import {
-  extractNetflowForToken,
-  extractDexVolumeForToken,
-} from './nansen';
+import { extractNetflowForToken, extractDexVolumeForToken } from './nansen';
 import { SIGNAL_THRESHOLDS, FEAR_GREED_THRESHOLDS } from './config';
 
 export type SignalLabel = 'STRONG BUY' | 'BUY' | 'NEUTRAL' | 'SELL' | 'STRONG SELL';
@@ -21,6 +18,7 @@ export interface TokenSignal {
   sellVolume: number;
   fundingRate: number | null;
   fearGreed: number | null;
+  price: number;
   breakdown: string[];
 }
 
@@ -29,7 +27,8 @@ export function scoreToken(
   netflowData: any,
   dexData: any,
   fearGreed: FearGreed | null,
-  fundingRates: FundingRate[]
+  fundingRates: FundingRate[],
+  price: number = 0,
 ): TokenSignal {
   let score = 0;
   const breakdown: string[] = [];
@@ -37,33 +36,42 @@ export function scoreToken(
   // ── Nansen Smart Money Netflow ──────────────────────────
   const netflow = extractNetflowForToken(netflowData, symbol);
   if (netflow !== null) {
-    if (netflow > 500_000) { score += 3; breakdown.push(`⬆ Netflow +$${fmt(netflow)} (strong buy)`); }
-    else if (netflow > 0) { score += 1; breakdown.push(`⬆ Netflow +$${fmt(netflow)}`); }
-    else if (netflow < -500_000) { score -= 3; breakdown.push(`⬇ Netflow -$${fmt(Math.abs(netflow))} (strong sell)`); }
-    else if (netflow < 0) { score -= 1; breakdown.push(`⬇ Netflow -$${fmt(Math.abs(netflow))}`); }
+    if (netflow > 500_000)       { score += 3; breakdown.push(`⬆ Netflow +${fmtUsd(netflow)} (strong inflow)`); }
+    else if (netflow > 100_000)  { score += 2; breakdown.push(`⬆ Netflow +${fmtUsd(netflow)}`); }
+    else if (netflow > 0)        { score += 1; breakdown.push(`⬆ Netflow +${fmtUsd(netflow)} (mild)`); }
+    else if (netflow < -500_000) { score -= 3; breakdown.push(`⬇ Netflow ${fmtUsd(netflow)} (strong outflow)`); }
+    else if (netflow < -100_000) { score -= 2; breakdown.push(`⬇ Netflow ${fmtUsd(netflow)}`); }
+    else if (netflow < 0)        { score -= 1; breakdown.push(`⬇ Netflow ${fmtUsd(netflow)} (mild)`); }
+  } else {
+    breakdown.push('{grey-fg}— Netflow: no data{/}');
   }
 
   // ── Nansen DEX Volume ───────────────────────────────────
   const { buy, sell } = extractDexVolumeForToken(dexData, symbol);
   if (buy > 0 || sell > 0) {
-    const ratio = buy / (buy + sell + 0.001);
-    if (ratio > 0.65) { score += 2; breakdown.push(`🟢 DEX: ${pct(ratio)} buy pressure`); }
-    else if (ratio > 0.55) { score += 1; breakdown.push(`🟡 DEX: ${pct(ratio)} buy pressure`); }
-    else if (ratio < 0.35) { score -= 2; breakdown.push(`🔴 DEX: ${pct(1 - ratio)} sell pressure`); }
-    else if (ratio < 0.45) { score -= 1; breakdown.push(`🟡 DEX: ${pct(1 - ratio)} sell pressure`); }
+    const ratio = buy / (buy + sell);
+    if (ratio > 0.65)      { score += 2; breakdown.push(`🟢 DEX: ${pct(ratio)} buy pressure`); }
+    else if (ratio > 0.55) { score += 1; breakdown.push(`🟡 DEX: ${pct(ratio)} buy-leaning`); }
+    else if (ratio < 0.35) { score -= 2; breakdown.push(`🔴 DEX: ${pct(1-ratio)} sell pressure`); }
+    else if (ratio < 0.45) { score -= 1; breakdown.push(`🟡 DEX: ${pct(1-ratio)} sell-leaning`); }
+    else                   { breakdown.push(`⚖️  DEX: balanced (${pct(ratio)} buy)`); }
+  } else {
+    breakdown.push('{grey-fg}— DEX volume: no data{/}');
   }
 
   // ── Fear & Greed ────────────────────────────────────────
   const fgVal = fearGreed?.value ?? null;
   if (fgVal !== null) {
     if (fgVal <= FEAR_GREED_THRESHOLDS.EXTREME_FEAR) {
-      score += 2; breakdown.push(`😱 F&G: ${fgVal} (Extreme Fear = buy zone)`);
+      score += 2; breakdown.push(`😱 F&G: ${fgVal} — Extreme Fear (contrarian buy)`);
     } else if (fgVal <= FEAR_GREED_THRESHOLDS.FEAR) {
-      score += 1; breakdown.push(`😰 F&G: ${fgVal} (Fear)`);
+      score += 1; breakdown.push(`😰 F&G: ${fgVal} — Fear`);
     } else if (fgVal >= FEAR_GREED_THRESHOLDS.EXTREME_GREED) {
-      score -= 2; breakdown.push(`🤑 F&G: ${fgVal} (Extreme Greed = caution)`);
+      score -= 2; breakdown.push(`🤑 F&G: ${fgVal} — Extreme Greed (caution)`);
     } else if (fgVal >= FEAR_GREED_THRESHOLDS.GREED) {
-      score -= 1; breakdown.push(`😀 F&G: ${fgVal} (Greed)`);
+      score -= 1; breakdown.push(`😀 F&G: ${fgVal} — Greed`);
+    } else {
+      breakdown.push(`😐 F&G: ${fgVal} — Neutral`);
     }
   }
 
@@ -71,15 +79,20 @@ export function scoreToken(
   const fr = fundingRates.find(f => f.coin.toUpperCase() === symbol.toUpperCase());
   const fundingRate = fr?.fundingRate ?? null;
   if (fundingRate !== null) {
+    const frPct = (fundingRate * 100).toFixed(4);
     if (fundingRate < -0.0001) {
-      score += 2; breakdown.push(`💰 Funding: ${(fundingRate * 100).toFixed(4)}% (longs paid = bullish)`);
+      score += 2; breakdown.push(`💰 Funding: ${frPct}% (longs paid → bullish)`);
     } else if (fundingRate < 0) {
-      score += 1; breakdown.push(`💸 Funding: ${(fundingRate * 100).toFixed(4)}% (slightly bullish)`);
+      score += 1; breakdown.push(`💸 Funding: ${frPct}% (slightly bullish)`);
     } else if (fundingRate > 0.0003) {
-      score -= 2; breakdown.push(`🔥 Funding: +${(fundingRate * 100).toFixed(4)}% (shorts paid = bearish)`);
+      score -= 2; breakdown.push(`🔥 Funding: +${frPct}% (shorts paid → bearish)`);
     } else if (fundingRate > 0) {
-      score -= 1; breakdown.push(`📈 Funding: +${(fundingRate * 100).toFixed(4)}% (slightly bearish)`);
+      score -= 1; breakdown.push(`📈 Funding: +${frPct}% (slightly bearish)`);
+    } else {
+      breakdown.push(`⚡ Funding: ${frPct}% (neutral)`);
     }
+  } else {
+    breakdown.push('{grey-fg}— Funding: no data{/}');
   }
 
   // ── Label ───────────────────────────────────────────────
@@ -90,13 +103,15 @@ export function scoreToken(
   else if (score <= SIGNAL_THRESHOLDS.SELL) label = 'SELL';
   else label = 'NEUTRAL';
 
-  return { symbol, score, label, netflow, buyVolume: buy, sellVolume: sell, fundingRate, fearGreed: fgVal, breakdown };
+  return { symbol, score, label, netflow, buyVolume: buy, sellVolume: sell, fundingRate, fearGreed: fgVal, price, breakdown };
 }
 
-function fmt(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(0)}K`;
-  return n.toFixed(0);
+function fmtUsd(n: number): string {
+  const abs = Math.abs(n);
+  const sign = n >= 0 ? '+' : '-';
+  if (abs >= 1_000_000) return `${sign}$${(abs / 1_000_000).toFixed(1)}M`;
+  if (abs >= 1_000) return `${sign}$${(abs / 1_000).toFixed(0)}K`;
+  return `${sign}$${abs.toFixed(0)}`;
 }
 
 function pct(r: number): string {

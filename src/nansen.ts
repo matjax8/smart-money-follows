@@ -4,7 +4,7 @@
 // ============================================================
 
 import { execSync } from 'child_process';
-import { NANSEN_CACHE_TTL_S } from './config';
+import { NANSEN_CACHE_TTL_S, WATCHED_TOKENS } from './config';
 
 interface CacheEntry {
   data: any;
@@ -21,18 +21,21 @@ function nansenExec(args: string): any {
     return cached.data;
   }
   try {
-    const raw = execSync(`nansen ${args} 2>/dev/null`, { timeout: 20_000 }).toString();
+    const raw = execSync(`nansen ${args} 2>/dev/null`, {
+      timeout: 25_000,
+      maxBuffer: 10 * 1024 * 1024,
+    }).toString();
     const parsed = JSON.parse(raw);
     cache.set(cacheKey, { data: parsed, ts: now });
     return parsed;
-  } catch (e) {
+  } catch {
     return null;
   }
 }
 
 // ── 1. Smart Money Netflow ────────────────────────────────
 export function getSmartMoneyNetflow(chain = 'ethereum') {
-  return nansenExec(`research smart-money netflow --chain ${chain}`);
+  return nansenExec(`research smart-money netflow --chain ${chain} --limit 50`);
 }
 
 // ── 2. Smart Money DEX Trades ────────────────────────────
@@ -61,8 +64,6 @@ export function getSmartMoneyDcas(chain = 'ethereum') {
 }
 
 // ── 7. Token Screener ────────────────────────────────────
-// Note: costs 10 credits on free tier — aggressively cached (60s)
-// --include-stablecoins false so ETH/BTC/SOL/LINK/UNI appear in results
 export function getTokenScreener(chain = 'ethereum') {
   return nansenExec(`research token screener --chain ${chain} --timeframe 24h --include-stablecoins false --limit 50`);
 }
@@ -87,39 +88,54 @@ export function getPerpLeaderboard() {
   return nansenExec(`research perp leaderboard --limit 10`);
 }
 
-// ── 12. Portfolio (top smart wallet) ─────────────────────
-// Use a well-known smart wallet address (0x3f5CE5... = Binance hot wallet as example)
-export function getSmartWalletPortfolio(address = '0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045') {
+// ── 12. Portfolio (smart wallet) ─────────────────────────
+export function getSmartWalletPortfolio(address: string) {
   return nansenExec(`research profiler balance --address ${address} --chain ethereum`);
 }
 
-// ── Helper: extract netflow data for a specific token ─────
-// Field names differ per endpoint (verified against live API):
+// ── Nansen credit check (free, no credit cost) ──────────
+export function getNansenCredits(): number | null {
+  try {
+    const raw = execSync('nansen account 2>/dev/null', { timeout: 5000 }).toString();
+    const parsed = JSON.parse(raw);
+    return parsed?.data?.credits_remaining ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// ── Helper: match a token symbol against watched aliases ─
+function matchSymbol(apiSymbol: string, watchedSymbol: string): boolean {
+  const upper = apiSymbol.toUpperCase();
+  const token = WATCHED_TOKENS.find(t => t.symbol === watchedSymbol);
+  if (!token) return upper === watchedSymbol.toUpperCase();
+  return token.aliases.some(a => a.toUpperCase() === upper);
+}
+
+// ── Helper: get items from any Nansen response shape ─────
+function getItems(data: any): any[] {
+  if (!data?.success || !data?.data) return [];
+  if (Array.isArray(data.data)) return data.data;
+  if (data.data?.data && Array.isArray(data.data.data)) return data.data.data;
+  return [];
+}
+
+// ── Helper: extract netflow for a specific token ─────────
+// Field names per endpoint (verified against live API 2026-03-31):
 //   token screener:      netflow
-//   smart-money netflow: net_flow_24h_usd, net_flow_1h_usd
-export function extractNetflowForToken(netflowData: any, tokenSymbol: string): number | null {
-  if (!netflowData?.success || !netflowData?.data) return null;
-  const items: any[] = Array.isArray(netflowData.data)
-    ? netflowData.data
-    : netflowData.data?.data ?? [];
-  const match = items.find((t: any) =>
-    t.token_symbol?.toUpperCase() === tokenSymbol.toUpperCase()
-  );
+//   smart-money netflow:  net_flow_24h_usd, net_flow_1h_usd
+export function extractNetflowForToken(data: any, symbol: string): number | null {
+  const items = getItems(data);
+  const match = items.find(t => matchSymbol(t.token_symbol ?? '', symbol));
   if (!match) return null;
   return match.netflow ?? match.net_flow_24h_usd ?? match.net_flow_1h_usd ?? match.net_flow ?? null;
 }
 
 // ── Helper: extract DEX buy/sell volumes for a token ─────
-// Works with both smart-money dex-trades AND token screener data shapes
-export function extractDexVolumeForToken(dexData: any, tokenSymbol: string): { buy: number, sell: number } {
+export function extractDexVolumeForToken(data: any, symbol: string): { buy: number; sell: number } {
   const empty = { buy: 0, sell: 0 };
-  if (!dexData?.success || !dexData?.data) return empty;
-  const items: any[] = Array.isArray(dexData.data)
-    ? dexData.data
-    : dexData.data?.data ?? [];
-  const match = items.find((t: any) =>
-    t.token_symbol?.toUpperCase() === tokenSymbol.toUpperCase()
-  );
+  const items = getItems(data);
+  const match = items.find(t => matchSymbol(t.token_symbol ?? '', symbol));
   if (!match) return empty;
   return {
     buy:  match.buy_volume  ?? match.volume_buy  ?? 0,
@@ -127,26 +143,33 @@ export function extractDexVolumeForToken(dexData: any, tokenSymbol: string): { b
   };
 }
 
-// ── Helper: extract recent feed entries ──────────────────
-export function extractFeedEntries(dexData: any, perpData: any): string[] {
+// ── Helper: build feed entries from live data ────────────
+// Uses actual field names from Nansen API (verified 2026-03-31)
+export function extractFeedEntries(screenerData: any, perpData: any): string[] {
   const feed: string[] = [];
-  // DEX trades
-  const dexItems: any[] = Array.isArray(dexData?.data)
-    ? dexData.data
-    : dexData?.data?.data ?? [];
-  dexItems.slice(0, 5).forEach((t: any) => {
+
+  // Screener top movers
+  const screenerItems = getItems(screenerData);
+  screenerItems.slice(0, 5).forEach(t => {
     const sym = t.token_symbol ?? '???';
-    const dir = (t.buy_volume ?? 0) > (t.sell_volume ?? 0) ? 'bought' : 'sold';
-    feed.push(`Smart Money ${dir} ${sym} on DEX`);
+    const nf = t.netflow ?? 0;
+    const dir = nf > 0 ? '📈' : '📉';
+    const vol = Math.abs(nf);
+    const volStr = vol >= 1e6 ? `$${(vol/1e6).toFixed(1)}M` : vol >= 1e3 ? `$${(vol/1e3).toFixed(0)}K` : `$${vol.toFixed(0)}`;
+    feed.push(`${dir} ${sym}: ${nf > 0 ? '+' : '-'}${volStr} net flow (DEX)`);
   });
-  // Perp trades
-  const perpItems: any[] = Array.isArray(perpData?.data)
-    ? perpData.data
-    : perpData?.data?.data ?? [];
-  perpItems.slice(0, 3).forEach((t: any) => {
-    const coin = t.coin ?? t.symbol ?? '???';
-    const side = t.side ?? (t.is_long ? 'LONG' : 'SHORT');
-    feed.push(`Smart Perp Trader ${side} ${coin}`);
+
+  // Perp trades (fields: token_symbol, side, action, value_usd, trader_address_label)
+  const perpItems = getItems(perpData);
+  perpItems.slice(0, 5).forEach(t => {
+    const coin = t.token_symbol ?? '???';
+    const side = (t.side ?? '').toUpperCase();
+    const action = (t.action ?? '').toUpperCase();
+    const val = t.value_usd ?? 0;
+    const valStr = val >= 1e6 ? `$${(val/1e6).toFixed(1)}M` : val >= 1e3 ? `$${(val/1e3).toFixed(0)}K` : `$${val.toFixed(0)}`;
+    const label = t.trader_address_label || (t.trader_address ? t.trader_address.slice(0,6)+'…' : '?');
+    feed.push(`🐋 ${label} ${action} ${side} ${coin} (${valStr})`);
   });
-  return feed.slice(0, 8);
+
+  return feed.slice(0, 12);
 }

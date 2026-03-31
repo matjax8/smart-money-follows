@@ -5,6 +5,8 @@
 
 import { execSync } from 'child_process';
 import { writeFileSync, readFileSync, existsSync } from 'fs';
+import { resolve } from 'path';
+import axios from 'axios';
 import { TokenSignal } from './signal';
 import { PAPER_TRADE_SIZE_USD } from './config';
 
@@ -36,12 +38,45 @@ export interface TradeLog {
   pnlUsd?: number;
 }
 
-const TRADES_FILE = './trades.json';
+const TRADES_FILE = resolve(__dirname, '..', 'trades.json');
 const positions = new Map<string, Position>();
 let tradeLogs: TradeLog[] = [];
 let krakenAvailable: boolean | null = null;
 
-// Check if kraken-cli is installed
+// ── Price cache (batch all mids in one call) ─────────────
+let priceCache: { mids: Record<string, string>; ts: number } | null = null;
+const PRICE_CACHE_TTL = 10_000; // 10 seconds
+
+export async function getAllPrices(): Promise<Record<string, number>> {
+  if (priceCache && Date.now() - priceCache.ts < PRICE_CACHE_TTL) {
+    const result: Record<string, number> = {};
+    for (const [k, v] of Object.entries(priceCache.mids)) {
+      result[k] = parseFloat(v);
+    }
+    return result;
+  }
+  try {
+    const res = await axios.post(
+      'https://api.hyperliquid.xyz/info',
+      { type: 'allMids' },
+      { timeout: 5000 }
+    );
+    priceCache = { mids: res.data, ts: Date.now() };
+    const result: Record<string, number> = {};
+    for (const [k, v] of Object.entries(res.data as Record<string, string>)) {
+      result[k] = parseFloat(v);
+    }
+    return result;
+  } catch {
+    return {};
+  }
+}
+
+async function getPrice(symbol: string): Promise<number> {
+  const prices = await getAllPrices();
+  return prices[symbol.toUpperCase()] ?? 0;
+}
+
 function checkKraken(): boolean {
   if (krakenAvailable !== null) return krakenAvailable;
   try {
@@ -53,24 +88,6 @@ function checkKraken(): boolean {
   return krakenAvailable;
 }
 
-// Get current price via Hyperliquid (free, always available)
-async function getCurrentPrice(symbol: string): Promise<number> {
-  try {
-    const { default: axios } = await import('axios');
-    const res = await axios.post(
-      'https://api.hyperliquid.xyz/info',
-      { type: 'allMids' },
-      { timeout: 5000 }
-    );
-    const mids = res.data as Record<string, string>;
-    const price = mids[symbol.toUpperCase()];
-    return price ? parseFloat(price) : 0;
-  } catch {
-    return 0;
-  }
-}
-
-// Load existing trades from disk
 export function loadTrades() {
   try {
     if (existsSync(TRADES_FILE)) {
@@ -79,21 +96,17 @@ export function loadTrades() {
   } catch { tradeLogs = []; }
 }
 
-// Save trades to disk
 function saveTrades() {
   try {
     writeFileSync(TRADES_FILE, JSON.stringify(tradeLogs, null, 2));
   } catch {}
 }
 
-// Execute a paper trade based on signal
 export async function executePaperTrade(signal: TokenSignal): Promise<string | null> {
   const { symbol, label, score } = signal;
-
-  // Already have a position?
   const existing = positions.get(symbol);
 
-  // Check if we should close existing position
+  // Close if signal flipped
   if (existing) {
     if (
       (existing.side === 'LONG' && (label === 'SELL' || label === 'STRONG SELL')) ||
@@ -101,7 +114,7 @@ export async function executePaperTrade(signal: TokenSignal): Promise<string | n
     ) {
       return await closePosition(symbol);
     }
-    return null; // hold existing
+    return null;
   }
 
   // Open new position
@@ -110,31 +123,30 @@ export async function executePaperTrade(signal: TokenSignal): Promise<string | n
   } else if (label === 'SELL' || label === 'STRONG SELL') {
     return await openPosition(symbol, 'SHORT', score, label);
   }
-
   return null;
 }
 
 async function openPosition(symbol: string, side: 'LONG' | 'SHORT', score: number, signalLabel: string): Promise<string> {
-  const price = await getCurrentPrice(symbol);
-  const quantity = price > 0 ? PAPER_TRADE_SIZE_USD / price : 0.01;
+  const price = await getPrice(symbol);
+  if (price === 0) return `⚠️ No price for ${symbol} — skipping trade`;
+
+  const quantity = PAPER_TRADE_SIZE_USD / price;
   const id = `${symbol}-${Date.now()}`;
 
-  const position: Position = {
+  positions.set(symbol, {
     id, symbol, side, entryPrice: price, quantity,
     usdSize: PAPER_TRADE_SIZE_USD, entrySignal: signalLabel,
     entryScore: score, openedAt: new Date().toISOString(),
     currentPrice: price, pnlUsd: 0, pnlPct: 0,
-  };
-  positions.set(symbol, position);
+  });
 
-  const log: TradeLog = {
+  tradeLogs.push({
     id, symbol, side, action: 'OPEN', price, quantity,
     signal: signalLabel, score, timestamp: new Date().toISOString(),
-  };
-  tradeLogs.push(log);
+  });
   saveTrades();
 
-  // Attempt kraken-cli paper trade (graceful degrade)
+  // Attempt kraken-cli paper trade
   if (checkKraken()) {
     try {
       const pair = `${symbol}/USD`;
@@ -145,24 +157,23 @@ async function openPosition(symbol: string, side: 'LONG' | 'SHORT', score: numbe
     } catch {}
   }
 
-  return `📂 OPENED ${side} ${symbol} @ $${price.toFixed(2)} (score: ${score > 0 ? '+' : ''}${score})`;
+  return `📂 OPENED ${side} ${symbol} @ $${price.toFixed(2)} ($${PAPER_TRADE_SIZE_USD})`;
 }
 
 async function closePosition(symbol: string): Promise<string> {
   const pos = positions.get(symbol);
   if (!pos) return '';
 
-  const price = await getCurrentPrice(symbol);
+  const price = await getPrice(symbol);
   const pnl = pos.side === 'LONG'
     ? (price - pos.entryPrice) * pos.quantity
     : (pos.entryPrice - price) * pos.quantity;
 
-  const log: TradeLog = {
+  tradeLogs.push({
     id: pos.id, symbol, side: pos.side, action: 'CLOSE',
     price, quantity: pos.quantity, signal: 'EXIT',
     score: 0, timestamp: new Date().toISOString(), pnlUsd: pnl,
-  };
-  tradeLogs.push(log);
+  });
   saveTrades();
   positions.delete(symbol);
 
@@ -170,10 +181,11 @@ async function closePosition(symbol: string): Promise<string> {
   return `📤 CLOSED ${pos.side} ${symbol} @ $${price.toFixed(2)} → P&L: ${pnlStr}`;
 }
 
-// Update P&L for all open positions
+// Batch update all positions in one price fetch
 export async function updatePositions(): Promise<void> {
+  const prices = await getAllPrices();
   for (const [symbol, pos] of positions.entries()) {
-    const price = await getCurrentPrice(symbol);
+    const price = prices[symbol.toUpperCase()] ?? 0;
     if (price > 0) {
       pos.currentPrice = price;
       pos.pnlUsd = pos.side === 'LONG'
