@@ -153,7 +153,7 @@ export class Dashboard {
     if (feed.length === 0) {
       this.feedBox.setContent('\n  {yellow-fg}Waiting for data...{/}');
     } else {
-      const lines = feed.map((f, i) => {
+      const lines = feed.map((f) => {
         const ts = new Date().toTimeString().slice(0, 8);
         return `  {grey-fg}[${ts}]{/}  ${f}`;
       });
@@ -170,8 +170,8 @@ export class Dashboard {
         const pnlStr = p.pnlUsd >= 0
           ? `{green-fg}+$${p.pnlUsd.toFixed(2)}{/}`
           : `{red-fg}-$${Math.abs(p.pnlUsd).toFixed(2)}{/}`;
-        const sideCol = p.side === 'LONG' ? '{green-fg}LONG{/}' : '{red-fg}SHORT{/}';
-        return `  ${p.symbol.padEnd(7)} ${sideCol.padEnd(p.side === 'LONG' ? 18 : 19)} $${p.entryPrice.toFixed(2).padEnd(10)} $${p.currentPrice.toFixed(2).padEnd(10)} $${p.usdSize.toFixed(0).padEnd(8)} ${pnlStr}`;
+        const sideCol = p.side === 'LONG' ? '{green-fg}LONG {/}' : '{red-fg}SHORT{/}';
+        return `  ${p.symbol.padEnd(7)} ${sideCol}  $${p.entryPrice.toFixed(2).padEnd(10)} $${p.currentPrice.toFixed(2).padEnd(10)} $${p.usdSize.toFixed(0).padEnd(8)} ${pnlStr}`;
       });
       const pnlColour = totalPnl >= 0 ? 'green' : 'red';
       const totalStr = `  {bold}Total P&L: {${pnlColour}-fg}$${totalPnl.toFixed(2)}{/}{/}`;

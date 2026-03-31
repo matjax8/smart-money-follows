@@ -61,8 +61,10 @@ export function getSmartMoneyDcas(chain = 'ethereum') {
 }
 
 // ── 7. Token Screener ────────────────────────────────────
+// Note: costs 10 credits on free tier — aggressively cached (60s)
+// --include-stablecoins false so ETH/BTC/SOL/LINK/UNI appear in results
 export function getTokenScreener(chain = 'ethereum') {
-  return nansenExec(`research token screener --chain ${chain} --timeframe 24h --limit 20`);
+  return nansenExec(`research token screener --chain ${chain} --timeframe 24h --include-stablecoins false --limit 50`);
 }
 
 // ── 8. Token DEX Trades ──────────────────────────────────
@@ -92,6 +94,9 @@ export function getSmartWalletPortfolio(address = '0xd8dA6BF26964aF9D7eEd9e03E53
 }
 
 // ── Helper: extract netflow data for a specific token ─────
+// Field names differ per endpoint (verified against live API):
+//   token screener:      netflow
+//   smart-money netflow: net_flow_24h_usd, net_flow_1h_usd
 export function extractNetflowForToken(netflowData: any, tokenSymbol: string): number | null {
   if (!netflowData?.success || !netflowData?.data) return null;
   const items: any[] = Array.isArray(netflowData.data)
@@ -100,10 +105,12 @@ export function extractNetflowForToken(netflowData: any, tokenSymbol: string): n
   const match = items.find((t: any) =>
     t.token_symbol?.toUpperCase() === tokenSymbol.toUpperCase()
   );
-  return match ? (match.netflow ?? match.net_flow ?? null) : null;
+  if (!match) return null;
+  return match.netflow ?? match.net_flow_24h_usd ?? match.net_flow_1h_usd ?? match.net_flow ?? null;
 }
 
 // ── Helper: extract DEX buy/sell volumes for a token ─────
+// Works with both smart-money dex-trades AND token screener data shapes
 export function extractDexVolumeForToken(dexData: any, tokenSymbol: string): { buy: number, sell: number } {
   const empty = { buy: 0, sell: 0 };
   if (!dexData?.success || !dexData?.data) return empty;

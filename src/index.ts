@@ -8,15 +8,8 @@ import {
   getSmartMoneyNetflow,
   getSmartMoneyDexTrades,
   getSmartMoneyPerpTrades,
-  getSmartMoneyHoldings,
-  getSmartMoneyHistoricalHoldings,
-  getSmartMoneyDcas,
   getTokenScreener,
-  getTokenDexTrades,
-  getTokenTransfers,
-  getTokenHolders,
   getPerpLeaderboard,
-  getSmartWalletPortfolio,
   extractFeedEntries,
 } from './nansen';
 import { getFearGreed, getHyperliquidFunding } from './sentiment';
@@ -33,39 +26,42 @@ async function fetchAllData() {
 
   // ── Batch Nansen calls ─────────────────────────────────
   // (cached for 60s, so rapid refreshes won't burn credits)
+  // ── Credit strategy ────────────────────────────────────
+  // Free tier: ~10 credits per call, 30 credits remaining → be selective
+  // Primary: token screener (1 call covers netflow + buy/sell for all tokens)
+  // Secondary: perp trades + perp leaderboard for sentiment
+  // Expensive (smart-money endpoints): only call if screener unavailable
   const [
-    netflowData,
-    dexData,
-    perpData,
-    holdingsData,
-    historicalData,
-    dcaData,
     screenerData,
+    perpData,
     perpLeaderboard,
-    portfolioData,
   ] = await Promise.allSettled([
-    Promise.resolve(getSmartMoneyNetflow()),
-    Promise.resolve(getSmartMoneyDexTrades()),
-    Promise.resolve(getSmartMoneyPerpTrades()),
-    Promise.resolve(getSmartMoneyHoldings()),
-    Promise.resolve(getSmartMoneyHistoricalHoldings()),
-    Promise.resolve(getSmartMoneyDcas()),
     Promise.resolve(getTokenScreener()),
+    Promise.resolve(getSmartMoneyPerpTrades()),
     Promise.resolve(getPerpLeaderboard()),
-    Promise.resolve(getSmartWalletPortfolio()),
   ]);
 
-  // Also fetch per-token data for ETH (most liquid)
-  const ethToken = WATCHED_TOKENS.find(t => t.symbol === 'ETH')!;
-  const [ethDexTrades, ethTransfers, ethHolders] = await Promise.allSettled([
-    Promise.resolve(getTokenDexTrades(ethToken.address, ethToken.chain)),
-    Promise.resolve(getTokenTransfers(ethToken.address, ethToken.chain)),
-    Promise.resolve(getTokenHolders(ethToken.address, ethToken.chain)),
-  ]);
+  // Only call expensive endpoints if screener didn't work
+  const screenerOk = (screenerData.status === 'fulfilled' && screenerData.value?.success);
+  const [netflowData, dexData, _holdingsData, _historicalData, _dcaData, _portfolioData] =
+    await Promise.allSettled([
+      Promise.resolve(screenerOk ? null : getSmartMoneyNetflow()),
+      Promise.resolve(screenerOk ? null : getSmartMoneyDexTrades()),
+      Promise.resolve(null), // holdings - skipped to save credits
+      Promise.resolve(null), // historical - skipped to save credits
+      Promise.resolve(null), // dcas - skipped to save credits
+      Promise.resolve(null), // portfolio - skipped to save credits
+    ]);
 
-  const nf = netflowData.status === 'fulfilled' ? netflowData.value : null;
-  const dex = dexData.status === 'fulfilled' ? dexData.value : null;
-  const perp = perpData.status === 'fulfilled' ? perpData.value : null;
+  // Per-token calls (token dex-trades, transfers, holders) are available but
+  // cost additional credits — skipped in auto-refresh, available for manual deep-dive
+
+  // Screener has both netflow + buy/sell volume at lower credit cost than dedicated endpoints
+  // Use it as primary source for both; fall back to dedicated endpoints if unavailable
+  const screenerRaw = screenerData.status === 'fulfilled' ? screenerData.value : null;
+  const nf        = screenerRaw?.success ? screenerRaw : (netflowData.status === 'fulfilled' ? netflowData.value : null);
+  const dex       = screenerRaw?.success ? screenerRaw : (dexData.status === 'fulfilled' ? dexData.value : null);
+  const perp      = perpData.status      === 'fulfilled' ? perpData.value      : null;
 
   dashboard.update({ status: 'Fetching sentiment data...' });
 
@@ -85,10 +81,9 @@ async function fetchAllData() {
   // ── Build smart money feed ─────────────────────────────
   const feed = extractFeedEntries(dex, perp);
 
-  // Add screener insights
-  const screener = screenerData.status === 'fulfilled' ? screenerData.value : null;
-  if (screener?.data?.data) {
-    const topToken = screener.data.data[0];
+  // Add screener insights (using the already-resolved screenerRaw)
+  if (screenerRaw?.data?.data) {
+    const topToken = screenerRaw.data.data[0];
     if (topToken) {
       const dir = topToken.netflow > 0 ? '📈 inflow' : '📉 outflow';
       feed.push(`Token screener: ${topToken.token_symbol} leading ${dir} ($${fmtNum(Math.abs(topToken.netflow))})`);
